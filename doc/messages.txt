@@ -1,0 +1,30 @@
+
+Initial greeting:
+	LISTAIN nnn
+Where nnn is the protocol version number (e.g. 003).
+
+Command: LISTS
+Response:
+	LEN 3
+	0 List A
+	1 List B
+	3 List D
+	-
+	FAIL
+
+Command: LIST
+Response:
+	LEN 2
+	0 foo
+	10 bar
+	-
+	FAIL
+
+Command: ADDITEM <item> | ADDT <item>
+Action: Add <item> to the bottom or to the top of the list.
+Response: DONE / FAIL
+
+Command: DELITEM <id>
+Action: Remove the item with ID <id>.
+Response: DONE / FAIL
+
