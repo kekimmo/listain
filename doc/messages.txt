@@ -20,7 +20,11 @@ Response:
 	-
 	FAIL
 
-Command: ADDITEM <item> | ADDT <item>
+Command: ADDLIST <name>
+Action: Create a new list called <name>
+Response: DONE / FAIL
+
+Command: ADDITEMBOT <item> | ADDITEMTOP <item>
 Action: Add <item> to the bottom or to the top of the list.
 Response: DONE / FAIL
 

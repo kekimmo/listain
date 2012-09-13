@@ -9,6 +9,9 @@ import Network.Socket (sIsListening)
 import Text.Printf
 import Database.HDBC
 import Database.HDBC.Sqlite3
+import Control.Concurrent
+import Control.Monad
+import System.Posix.Signals
 
 
 type ListId = Int
@@ -18,10 +21,12 @@ type ItemId = Int
 data Item = Item { item_id :: ItemId, text :: String }
 data List = List { list_id :: ListId, items :: [Item] }
 type Lists = [(ListId, ListName)]
+data ListPos = ListBottom | ListTop
 
 
 listfile = "list.lst"
 dbfile = "listain.db"
+greeting = "LISTAIN 001"
 
 logf :: HPrintfType r => String -> r
 logf = hPrintf stderr
@@ -39,71 +44,49 @@ decodeItem string =
 
 
 encodeList :: List -> String
-encodeList (List items id_counter) = 
-	unlines (id_line : rest)
-	where
-		id_line = show id_counter
-		rest = map encodeItem items
-
-
-decodeList :: String -> List
-decodeList string =
-	List items id_counter
-	where
-		(id_line : item_lines) = (filter (not.null) . lines) string
-		items = map decodeItem item_lines
-		id_counter = read id_line
+encodeList list =
+	unlines_with_len (map encodeItem (items list))
 
 
 encodeLists :: Lists -> String
 encodeLists lists =
-	unlines (map (\(id, name) -> printf "%d %s" id name) lists)
+	unlines_with_len (map (\(id, name) -> printf "%d %s" id name) lists)
+
+
+unlines_with_len :: [String] -> String
+unlines_with_len lines =
+	unlines $ len_line : lines
+	where
+		len_line = printf "LEN %d" $ length lines
 
 
 itemCount :: List -> Int
-itemCount (List items _) = length items
+itemCount list = length $ items list
 
 
 cut :: String -> (String, String)
 cut string =
 	(first, rest)
 	where
-		first = head (words string)
-		rest = drop (length first + 1) string
+		parts = words string
+		(first, rest) = if parts == []
+			then ("", "")
+			else (head (words string), drop (length first + 1) string)
 
 
 initDB :: IO Connection
 initDB = do
 	db <- connectSqlite3 dbfile
-	run db "PRAGMA foreign_keys = ON"
-	run db "CREATE TABLE IF NOT EXISTS lists (id INTEGER NOT NULL, name VARCHAR(50) NOT NULL, PRIMARY KEY (id))" []
-	run db "CREATE TABLE IF NOT EXISTS items (list INTEGER NOT NULL, id INTEGER NOT NULL, text VARCHAR(255) NOT NULL, PRIMARY KEY (list, id), FOREIGN KEY (list) REFERENCES lists(id))" []
+	run db "PRAGMA foreign_keys = ON" []
+	run db "CREATE TABLE IF NOT EXISTS lists (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(50) NOT NULL)" []
+	run db "CREATE TABLE IF NOT EXISTS items (id INTEGER NOT NULL PRIMARY KEY, list INTEGER NOT NULL, text VARCHAR(255) NOT NULL, FOREIGN KEY (list) REFERENCES lists(id))" []
 	commit db
 	return db
 
 
-save :: List -> IO ()
-save list = do
-	(tempfile, temph) <- openTempFile "." (listfile ++ ".tmp")
-	logf "Opened temporary file %s.\n" tempfile
-	finally
-		(hPutStrLn temph $ encodeList list)
-		(hClose temph)
-	renameFile tempfile listfile
-	logf "Saved list with %d items.\n" (itemCount list)
-
-
-load :: IO List
-load = do
-	h <- openFile listfile ReadMode
-	contents <- hGetContents h
-	let list = decodeList contents
-	logf "Loaded list with %d items.\n" (itemCount list)
-	return list
-
-
 main :: IO ()
 main = do
+	
 	db <- initDB
 	withSocketsDo $ do
 		let port = PortNumber 11511
@@ -114,42 +97,86 @@ main = do
 
 listenLoop :: Connection -> Socket -> IO ()
 listenLoop db s = do
-	listening <- sIsListening s
-	if listening
-		then do
-			(h, host, port) <- accept s
-			logf "Accepted connection from %s.\n" host
-			-- list <- load
-			finally (process db h host port) (hClose h)
-			listenLoop s
-		else
-			return ()
+	-- listening <- sIsListening s
+--	if listening
+	(h, host, port) <- accept s
+	let worker = do
+		let port_number = fromIntegral port :: Int
+		hSetBuffering h LineBuffering
+		logf "Accepted connection: %s:%d.\n" host port_number
+		hPutStrLn h greeting
+		finally (process db h host port) (hClose h)
+		logf "Closed connection: %s:%d.\n" host port_number
+	forkIO worker
+	listenLoop db s
 
 
-loadLists :: Connection -> IO [(ListId, ListName)]
+loadLists :: Connection -> IO Lists
 loadLists db = do
-	results <- quickQuery "SELECT FROM lists (id, name)" []
+	results <- quickQuery' db "SELECT id, name FROM lists" []
 	return $ map processRow results
 	where
 		processRow :: [SqlValue] -> (ListId, ListName)
 		processRow [id, name] = (fromSql id, fromSql name)
 
 
+loadList :: Connection -> ListId -> IO List
+loadList db list = do
+	results <- quickQuery' db "SELECT id, text FROM items WHERE list = ?" [toSql list]
+	return $ List list (map processRow results)
+	where
+		processRow [id, text] = Item (fromSql id) (fromSql text)
+
+
+addList :: Connection -> ListName -> IO ()
+addList db name = do
+	quickQuery' db "INSERT INTO lists (name) VALUES (?)" [toSql name]
+	commit db
+	return ()
+
+
+addItem :: Connection -> ListId -> ListPos -> String -> IO ()
+addItem db list pos text = do
+	quickQuery' db "INSERT INTO items (list, text) VALUES (?, ?)" [toSql list, toSql text]
+	commit db
+	return ()
+
+
 process :: Connection -> Handle -> HostName -> PortNumber -> IO ()
 process db h host port = do
-	line <- hGetLine h
-	let (cmd, rest) = cut line
-	logf "Received command '%s' with parameters '%s'.\n" cmd rest
-	react db h cmd rest
+	eof <- hIsEOF h
+	if not eof then do
+		(cmd, rest) <- liftM (cut . stripLinefeed) $ hGetLine h
+		logf "Received command '%s' with parameters '%s'.\n" cmd rest
+		react db h cmd rest
+		process db h host port
+	else
+		return ()
 
 
-react :: Connection -> Handle -> String -> String -> IO (Maybe List)
-react db h list cmd rest
-	| cmd == "LISTS" = do
-		lists <- loadLists
-		hPutStrLn h $ encodeLists lists
-		return Nothing
-	| otherwise = do
+stripLinefeed :: String -> String
+stripLinefeed = reverse . dropWhile (== '\r') . reverse
+
+
+react :: Connection -> Handle -> String -> String -> IO ()
+react db h cmd rest =
+	case cmd of
+	"LISTS" -> do
+		lists <- loadLists db
+		hPutStr h (encodeLists lists)
+	"LIST" -> do
+		let id = read rest
+		list <- loadList db id
+		hPutStr h (encodeList list)
+	"ADDLIST" -> do
+		addList db rest
+		hPutStrLn h "DONE"
+	"ADDITEMBOT" -> do
+		let (list_str, text) = cut rest
+		let list = read list_str
+		addItem db list ListBottom text
+		hPutStrLn h "DONE"
+	_ -> do
 		hPutStrLn h "FAIL"
-		return Nothing
+
 
